@@ -1,0 +1,10 @@
+.env aç
+
+envi .env.example gibi yap:
+
+OPENAI_API_KEY=your_openai_api_key_here
+EXA_API_KEY=your_exa_api_key_here
+
+çalıştır.
+
+profit.
