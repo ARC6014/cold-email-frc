@@ -1,3 +1,5 @@
+import re
+
 from openai import OpenAI
 from exa_py import Exa
 
@@ -26,6 +28,107 @@ Sponsorluk Karşılıkları:
 - Yerel ve uluslararası yarışma medyasında görünürlük
 - STEM topluluğuyla networking ve marka bilinirliği
 """
+
+
+def find_contacts(company_name: str, company_url: str, exa_api_key: str) -> dict:
+    """Find email addresses and LinkedIn profiles for a company."""
+    exa = Exa(api_key=exa_api_key)
+    emails = []
+    people = []
+    seen_emails = set()
+
+    # 1. Crawl company pages for email addresses
+    base = company_url.rstrip("/")
+    pages = [base, f"{base}/iletisim", f"{base}/contact", f"{base}/hakkimizda", f"{base}/about"]
+    try:
+        result = exa.get_contents(pages, text={"max_characters": 3000})
+        for r in result.results:
+            if r.text:
+                found = re.findall(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", r.text)
+                for email in found:
+                    if email not in seen_emails and not email.lower().endswith((".png", ".jpg")):
+                        seen_emails.add(email)
+                        emails.append(email)
+    except Exception:
+        pass
+
+    # 2. Search LinkedIn for people at this company
+    try:
+        results = exa.search(
+            f'"{company_name}" site:linkedin.com/in',
+            type="auto",
+            num_results=5,
+            contents={"text": {"max_characters": 400}, "highlights": True},
+        )
+        for r in results.results:
+            raw = r.title or ""
+            name = raw.replace("| LinkedIn", "").strip()
+            title = ""
+            if " - " in name:
+                parts = name.split(" - ")
+                name = parts[0].strip()
+                title = parts[1].strip() if len(parts) > 1 else ""
+            if name:
+                people.append({"name": name, "title": title, "linkedin_url": r.url})
+    except Exception:
+        pass
+
+    return {"emails": emails, "people": people}
+
+
+def find_rc_alumni(query_extra: str, exa_api_key: str, num_results: int = 10) -> list[dict]:
+    """Search for Robert Koleji / Robert College alumni on LinkedIn via Exa."""
+    exa = Exa(api_key=exa_api_key)
+    query = '"Robert Koleji" OR "Robert College" site:linkedin.com/in'
+    if query_extra.strip():
+        query += f" {query_extra.strip()}"
+    results = exa.search(
+        query,
+        type="auto",
+        num_results=num_results,
+        contents={"text": {"max_characters": 500}, "highlights": True},
+    )
+    people = []
+    for r in results.results:
+        raw = r.title or ""
+        name = raw.replace("| LinkedIn", "").strip()
+        title = ""
+        if " - " in name:
+            parts = name.split(" - ")
+            name = parts[0].strip()
+            title = parts[1].strip() if len(parts) > 1 else ""
+        if name:
+            people.append({
+                "name": name,
+                "title": title,
+                "linkedin_url": r.url,
+                "source": "RC Mezunu",
+            })
+    return people
+
+
+def find_companies(query: str, exa_api_key: str, num_results: int = 8) -> list[dict]:
+    """Search for companies related to a query using Exa."""
+    exa = Exa(api_key=exa_api_key)
+    results = exa.search(
+        query,
+        type="auto",
+        num_results=num_results,
+        contents={"text": {"max_characters": 800}, "highlights": True},
+    )
+    companies = []
+    for r in results.results:
+        desc = ""
+        if hasattr(r, "highlights") and r.highlights:
+            desc = r.highlights[0]
+        elif r.text:
+            desc = r.text[:200]
+        companies.append({
+            "name": r.title or r.url,
+            "url": r.url,
+            "description": desc,
+        })
+    return companies
 
 
 def research_person(first_name: str, last_name: str, linkedin_url: str, exa_api_key: str) -> str:
@@ -58,7 +161,6 @@ def research_person(first_name: str, last_name: str, linkedin_url: str, exa_api_
         people = exa.search(
             name,
             type="auto",
-            category="people",
             num_results=5,
             contents={"text": {"max_characters": 2000}, "highlights": True},
         )
@@ -151,7 +253,7 @@ Robert Koleji, İstanbul
                 "content": (
                     "Sen ARC 6014 FRC Robotics Takımı adına sponsorluk e-postaları yazan "
                     "deneyimli bir iletişim uzmanısın. Şablondan uzak, araştırma verilerine "
-                    "dayanan, gerçekten kişiye özel Türkçe e-postalar yazarsın."
+                    "dayanan, gerçekten kişiye özel Türkçe e-postalar yazarsın. Yazdığın email sadece bir kişiye yazılmış gibi durmalı."
                 ),
             },
             {"role": "user", "content": prompt},
