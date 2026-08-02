@@ -131,35 +131,50 @@ def find_companies(query: str, exa_api_key: str, num_results: int = 8) -> list[d
     return companies
 
 
-def research_person(first_name: str, last_name: str, linkedin_url: str, exa_api_key: str) -> str:
-    """Gather public info about the prospect using Exa."""
+def research_person(
+    first_name: str,
+    last_name: str,
+    linkedin_url: str,
+    exa_api_key: str,
+    company: str = "",
+) -> str:
+    """Gather public info about the prospect using Exa.
+
+    `linkedin_url` may be empty (e.g. for CSV-imported prospects); in that case
+    research falls back to a name + company search. `company`, when provided,
+    sharpens the people/web searches.
+    """
     exa = Exa(api_key=exa_api_key)
-    name = f"{first_name} {last_name}"
+    name = f"{first_name} {last_name}".strip()
+    company = (company or "").strip()
+    # Name plus company disambiguates common names in the search queries.
+    name_query = f"{name} {company}".strip()
     sections = []
 
-    # 1. Livecrawl the LinkedIn URL directly
-    try:
-        result = exa.get_contents(
-            [linkedin_url],
-            text={"max_characters": 6000},
-            highlights=True,
-        )
-        if result.results:
-            r = result.results[0]
-            content_parts = []
-            if r.text and len(r.text.strip()) > 100:
-                content_parts.append(r.text.strip())
-            elif hasattr(r, "highlights") and r.highlights:
-                content_parts.append("\n".join(r.highlights))
-            if content_parts:
-                sections.append("## LinkedIn Profil İçeriği\n" + "\n".join(content_parts))
-    except Exception:
-        pass
+    # 1. Livecrawl the LinkedIn URL directly (only when one was supplied)
+    if linkedin_url and "linkedin.com" in linkedin_url:
+        try:
+            result = exa.get_contents(
+                [linkedin_url],
+                text={"max_characters": 6000},
+                highlights=True,
+            )
+            if result.results:
+                r = result.results[0]
+                content_parts = []
+                if r.text and len(r.text.strip()) > 100:
+                    content_parts.append(r.text.strip())
+                elif hasattr(r, "highlights") and r.highlights:
+                    content_parts.append("\n".join(r.highlights))
+                if content_parts:
+                    sections.append("## LinkedIn Profil İçeriği\n" + "\n".join(content_parts))
+        except Exception:
+            pass
 
     # 2. People-category search (LinkedIn index)
     try:
         people = exa.search(
-            name,
+            name_query,
             type="auto",
             num_results=5,
             contents={"text": {"max_characters": 2000}, "highlights": True},
@@ -181,7 +196,7 @@ def research_person(first_name: str, last_name: str, linkedin_url: str, exa_api_
     # 3. General web search for news, interviews, company pages
     try:
         web = exa.search(
-            f"{name}",
+            name_query,
             type="auto",
             num_results=5,
             contents={"highlights": True},
@@ -204,36 +219,84 @@ def research_person(first_name: str, last_name: str, linkedin_url: str, exa_api_
     return "\n\n".join(sections)
 
 
-def generate_email(first_name: str, last_name: str, research: str, openai_api_key: str) -> str:
-    """Generate a hyper-personalized Turkish sponsorship email."""
+def generate_email(
+    first_name: str,
+    last_name: str,
+    research: str,
+    openai_api_key: str,
+    company: str = "",
+    salutation: str = "",
+    notes: str = "",
+) -> str:
+    """Generate a hyper-personalized Turkish sponsorship email.
+
+    `company`, `salutation` (Hitap) and `notes` (Notlar) come from the CSV
+    import and, when present, are woven into the prompt for tighter targeting.
+    """
     client = OpenAI(api_key=openai_api_key)
 
+    full_name = f"{first_name} {last_name}".strip()
+    salutation = (salutation or "").strip()
+    company = (company or "").strip()
+    notes = (notes or "").strip()
+
+    context_lines = []
+    if company:
+        context_lines.append(f"Şirket: {company}")
+    if salutation:
+        context_lines.append(
+            f"Hitap: E-postaya bu hitapla başla (ör. \"Sayın {salutation},\"): {salutation}"
+        )
+    if notes:
+        context_lines.append(f"Notlar (dahili bağlam, aynen tekrar etme): {notes}")
+    context_block = ("\nEK BAĞLAM:\n" + "\n".join(context_lines) + "\n") if context_lines else ""
+
     prompt = f"""
-ARC 6014 FRC Robotics Takımı adına {first_name} {last_name} için bir sponsorluk e-postası yazacaksın.
+ARC 6014 FRC Robotics Takımı adına {full_name} için bir sponsorluk e-postası yazacaksın.
 
 TAKIM BİLGİSİ:
 {TEAM_CONTEXT}
 
-SPONSOR ADAYI: {first_name} {last_name}
-
+SPONSOR ADAYI: {full_name}
+{context_block}
 ARAŞTIRMA SONUÇLARI:
 {research}
 
 GÖREV:
-Yukarıdaki araştırma sonuçlarını kullanarak tamamen Türkçe, son derece kişiselleştirilmiş bir
+Yukarıdaki araştırma sonuçlarını kullanarak tamamen Türkçe, kişiye özel, kısa ve etkili bir
 sponsorluk e-postası yaz.
 
+YAPI (tam olarak bu 4 paragrafı, bu sırayla kullan):
+1. AÇILIŞ + kişiselleştirme: Hitapla başla. Notlar "Rc mezunu" / "Robert Koleji" içeriyorsa,
+   ilk cümlede ortak Robert Koleji bağına değin ve ARC 6014'ün Robert Koleji'nin kendi FRC
+   takımı olduğunu belirt. Ardından kişi/şirket hakkında araştırmadan gelen SOMUT bir detaya
+   değinerek ödevini yaptığını göster. (Mezun değilse: doğrudan şirket/pozisyona dair somut
+   bir detayla aç.)
+2. ÖNCE ONLARIN KAZANCI: Sponsorluğun şirkete ne kazandıracağını anlat — STEM/genç yetenek
+   kitlesinde marka görünürlüğü, ödüllü bir takımla anılmak, eğitim/sosyal etki — hepsini
+   şirketin işiyle bağlayarak. Takımın kendi ihtiyaçlarıyla değil, onların faydasıyla başla.
+3. GÜVENİLİRLİK + KARŞILIKLAR: Kısa bir sosyal kanıt ver (2018 Houston Dünya Şampiyonası ve
+   FIRST Impact Award). Ardından tam olarak şu ÜÇ karşılığı sun (hepsini, aynen):
+   (a) robot ve yarış kıyafetlerinde şirket logosu,
+   (b) şirket ekiplerine özel robotik demonstrasyonu / STEM atölyesi,
+   (c) web sitesi, sosyal medya ve yarışma medyasında kalıcı görünürlük.
+4. NET ÇAĞRI + kapanış: Tek ve kolay bir sonraki adım iste (örn. "önümüzdeki hafta 15 dakikalık
+   kısa bir görüşme"). Sonra imzayı ekle.
+
 KURALLAR:
-1. E-posta tamamen Türkçe olmalı
-2. Kişinin pozisyonuna, şirketine ve arka planına göre kişiselleştirilmiş olmalı — genel bir
-   şablon gibi hissettirmemeli
-3. Kişinin şirketinin veya kariyer geçmişinin ARC 6014'ün misyon ve değerleriyle nasıl
-   örtüştüğünü doğal bir şekilde vurgula
-4. Samimi, profesyonel ve sıcak bir ton kullan; robotik ve STEM'e olan tutkuyu yansıt
-5. 300-400 kelime arasında tut
-6. Konu satırı dahil et — dikkat çekici ve kişiye özel olmalı
-7. Açık bir eylem çağrısı (CTA) içermeli (örn. kısa bir toplantı veya robot demonstrasyonu teklifi)
-8. Takımın başarılarını abartmadan doğal biçimde yerleştir
+1. E-posta tamamen Türkçe olmalı.
+2. 220-280 kelime arasında tut; kısa paragraflar kullan, gereksiz doldurma yapma.
+3. Şablon gibi durmasın; sadece bu kişiye yazılmış gibi olsun.
+4. ÖNEMLİ — Uydurma yok: Yalnızca araştırmada net biçimde bu kişiye/şirkete ait olduğundan
+   emin olduğun bilgileri kullan. Araştırma zayıfsa kişiselleştirmeyi genel tut ve hiçbir
+   isim, unvan, proje veya rakam uydurma.
+5. Samimi, profesyonel ve sıcak bir ton; robotik ve STEM tutkusunu yansıt.
+6. Karşılıkları abartma; yukarıdaki üç maddeyle sınırlı kal.
+7. Bir "Hitap" verildiyse e-postaya tam olarak o hitapla başla; verilmediyse uygun resmi bir
+   hitap seç.
+
+KONU SATIRI: En fazla 6 kelime, şirket adını içersin, merak uyandırsın ama abartılı/clickbait
+olmasın. Örnek biçim: "ARC 6014 × [Şirket]: sponsorluk fırsatı".
 
 FORMAT (tam olarak bu yapıyı kullan):
 Konu: [konu satırı]

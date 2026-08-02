@@ -1,0 +1,12 @@
+[server]
+headless = true
+# Streamlit Community Cloud sets the port itself; these are used for self-hosting.
+address = "0.0.0.0"
+port = 8501
+maxUploadSize = 5
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+base = "light"

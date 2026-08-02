@@ -21,32 +21,72 @@ st.set_page_config(
     layout="centered",
 )
 
+
+# ── Config / secrets ──────────────────────────────────────────────────────────
+def get_secret(name: str, default: str = "") -> str:
+    """Read a value from Streamlit secrets, falling back to the environment."""
+    try:
+        if name in st.secrets:
+            return str(st.secrets[name])
+    except Exception:
+        pass
+    return os.getenv(name, default)
+
+
+def check_password() -> bool:
+    """Gate the app behind a shared team password (APP_PASSWORD secret)."""
+    app_password = get_secret("APP_PASSWORD")
+    if not app_password:
+        st.warning(
+            "APP_PASSWORD ayarlanmadı — uygulama şifresiz çalışıyor. "
+            "Yönetici: Streamlit secrets içine APP_PASSWORD ekleyin."
+        )
+        return True
+    if st.session_state.get("auth_ok"):
+        return True
+
+    st.title("ARC 6014 E-posta Üretici")
+    st.caption("Devam etmek için takım şifresini girin.")
+    pw = st.text_input("Takım şifresi", type="password")
+    if st.button("Giriş", type="primary"):
+        if pw == app_password:
+            st.session_state["auth_ok"] = True
+            st.rerun()
+        else:
+            st.error("Yanlış şifre.")
+    return False
+
+
+if not check_password():
+    st.stop()
+
+# Keys are provided by the server (Streamlit secrets / env), never entered in the UI.
+openai_key = get_secret("OPENAI_API_KEY")
+exa_key = get_secret("EXA_API_KEY")
+if not openai_key or not exa_key:
+    st.error(
+        "Sunucu yapılandırması eksik: OPENAI_API_KEY ve/veya EXA_API_KEY tanımlı değil. "
+        "Yönetici: Streamlit secrets (veya .env) içine ekleyin."
+    )
+    st.stop()
+
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.header("Ayarlar")
-    openai_key = st.text_input(
-        "OpenAI API Key",
-        value=os.getenv("OPENAI_API_KEY", ""),
-        type="password",
-        help="E-posta üretimi için kullanılır",
-    )
-    exa_key = st.text_input(
-        "Exa API Key",
-        value=os.getenv("EXA_API_KEY", ""),
-        type="password",
-        help="Araştırma için kullanılır (exa.ai)",
-    )
-    st.divider()
     batch_count = len(st.session_state.get("batch_people", []))
     if batch_count:
         st.metric("Toplu listede", f"{batch_count} kişi")
         if st.button("Toplu Üretime Git", use_container_width=True):
             st.session_state["pending_tab"] = "Toplu Üretim"
             st.rerun()
-    st.divider()
+        st.divider()
     st.markdown("**ARC 6014**")
     st.markdown("İstanbul Robert Koleji FRC Robotics Takımı")
     st.markdown("[arc6014.com](https://arc6014.com)")
+    if st.session_state.get("auth_ok"):
+        st.divider()
+        if st.button("Çıkış", use_container_width=True):
+            st.session_state.pop("auth_ok", None)
+            st.rerun()
 
 st.title("ARC 6014 Sponsorluk E-postası Üretici")
 st.caption("Robert Koleji FRC Takımı için kişiselleştirilmiş Türkçe sponsorluk e-postaları")
@@ -101,6 +141,89 @@ def _render_person_row(person: dict, key_prefix: str):
             st.session_state["pending_tab"] = "Direkt E-posta"
             st.rerun()
     st.divider()
+
+
+def _norm(s: str) -> str:
+    """Lowercase and strip Turkish diacritics for header matching."""
+    table = str.maketrans("şŞıİğĞüÜöÖçÇ", "sSiIgGuUoOcC")
+    return (s or "").strip().translate(table).lower()
+
+
+def parse_prospect_csv(raw: str):
+    """Parse a prospect sheet (CSV/TSV) into batch-people dicts.
+
+    Recognized headers (Turkish, case/diacritic-insensitive): Şirket, Tam İsim,
+    Contact Info (mail), Hitap, Telefon, Notlar. A leading unnamed column is
+    treated as the assignee. Returns (people, warnings).
+    """
+    warnings = []
+    raw = raw.replace("\r\n", "\n").replace("\r", "\n")
+    lines = raw.split("\n")
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    if not lines:
+        return [], ["Dosya boş."]
+
+    header_line = lines[0]
+    if "\t" in header_line:
+        delim = "\t"
+    elif header_line.count(";") > header_line.count(","):
+        delim = ";"
+    else:
+        delim = ","
+
+    rows = [r for r in csv.reader(lines, delimiter=delim)]
+    if not rows:
+        return [], ["Dosya okunamadı."]
+
+    norm_header = [_norm(h) for h in rows[0]]
+
+    def find_col(keywords):
+        for idx, h in enumerate(norm_header):
+            if any(k in h for k in keywords):
+                return idx
+        return None
+
+    idx_company = find_col(["sirket", "company", "kurum", "firma"])
+    idx_name = find_col(["tam isim", "ad soyad", "isim", "name", "kisi"])
+    idx_email = find_col(["mail", "e-posta", "eposta", "email", "contact"])
+    idx_sal = find_col(["hitap", "salutation"])
+    idx_phone = find_col(["telefon", "phone", "gsm", "tel"])
+    idx_notes = find_col(["not", "aciklama", "description"])
+    idx_assignee = next((i for i, h in enumerate(norm_header) if not h), None)
+
+    if idx_name is None:
+        return [], ["'Tam İsim' sütunu bulunamadı. Başlık satırını kontrol edin."]
+    if idx_email is None:
+        warnings.append("E-posta sütunu bulunamadı; alıcı adresleri boş kalacak.")
+
+    def cell(row, idx):
+        return row[idx].strip() if idx is not None and idx < len(row) else ""
+
+    people = []
+    for row in rows[1:]:
+        if not any(c.strip() for c in row):
+            continue
+        full_name = cell(row, idx_name)
+        if not full_name:
+            continue
+        company = cell(row, idx_company)
+        notes = cell(row, idx_notes)
+        people.append({
+            "name": full_name,
+            "title": notes,
+            "linkedin_url": "",
+            "source": company,
+            "company": company,
+            "salutation": cell(row, idx_sal),
+            "notes": notes,
+            "email": cell(row, idx_email),
+            "phone": cell(row, idx_phone),
+            "assignee": cell(row, idx_assignee),
+        })
+    if not people:
+        warnings.append("Veri satırı bulunamadı.")
+    return people, warnings
 
 
 # ── TAB: Şirket Bul ───────────────────────────────────────────────────────────
@@ -216,6 +339,53 @@ elif active_tab == "RC Mezunları":
 
 # ── TAB: Toplu Üretim ─────────────────────────────────────────────────────────
 elif active_tab == "Toplu Üretim":
+    with st.expander("CSV / tablo içe aktar", expanded=not st.session_state["batch_people"]):
+        st.caption(
+            "Sütunlar: **Şirket, Tam İsim, Contact Info (mail), Hitap, Telefon, Notlar** "
+            "(baştaki isimsiz sütun 'atanan' olarak alınır). Sekme, virgül veya noktalı "
+            "virgülle ayrılmış dosyalar desteklenir."
+        )
+        uploaded = st.file_uploader(
+            "CSV / TSV dosyası", type=["csv", "tsv", "txt"], key="batch_csv"
+        )
+        replace_existing = st.checkbox("Mevcut listenin yerine koy", value=False)
+        if uploaded is not None and st.button("İçe Aktar", key="import_csv"):
+            data = uploaded.getvalue()
+            raw = None
+            for enc in ("utf-8-sig", "cp1254", "iso-8859-9"):
+                try:
+                    raw = data.decode(enc)
+                    break
+                except UnicodeDecodeError:
+                    continue
+            if raw is None:
+                raw = data.decode("utf-8", errors="replace")
+
+            people, warnings = parse_prospect_csv(raw)
+            if not people:
+                st.error("Dosyadan geçerli kişi okunamadı. Sütun başlıklarını kontrol edin.")
+                for w in warnings:
+                    st.warning(w)
+            else:
+                if replace_existing:
+                    st.session_state["batch_people"] = people
+                    added = len(people)
+                else:
+                    existing = st.session_state["batch_people"]
+                    seen = {(p.get("name", ""), p.get("company", "")) for p in existing}
+                    added = 0
+                    for p in people:
+                        key = (p.get("name", ""), p.get("company", ""))
+                        if key not in seen:
+                            existing.append(p)
+                            seen.add(key)
+                            added += 1
+                st.session_state.pop("batch_results", None)
+                st.success(f"{added} kişi içe aktarıldı.")
+                for w in warnings:
+                    st.warning(w)
+                st.rerun()
+
     batch = st.session_state["batch_people"]
 
     if not batch:
@@ -232,7 +402,7 @@ elif active_tab == "Toplu Üretim":
                 st.markdown(f"**{person['name']}**")
                 parts = [person.get("title", ""), person.get("source", "")]
                 st.caption(" · ".join(p for p in parts if p))
-                st.caption(person["linkedin_url"])
+                st.caption(person.get("linkedin_url") or person.get("email", ""))
             with col_del:
                 if st.button("Kaldır", key=f"remove_{i}"):
                     st.session_state["batch_people"].pop(i)
@@ -263,15 +433,23 @@ elif active_tab == "Toplu Üretim":
                     first = name_parts[0]
                     last = name_parts[1] if len(name_parts) > 1 else ""
 
+                    company = person.get("company", "") or person.get("source", "")
                     status_text.text(f"({i + 1}/{len(batch)}) {person['name']} araştırılıyor...")
                     try:
-                        research = research_person(first, last, person["linkedin_url"], exa_key)
+                        research = research_person(
+                            first, last, person.get("linkedin_url", ""), exa_key, company=company
+                        )
                     except Exception as e:
                         research = f"Araştırma başarısız: {e}"
 
                     status_text.text(f"({i + 1}/{len(batch)}) {person['name']} için e-posta yazılıyor...")
                     try:
-                        email_text = generate_email(first, last, research, openai_key)
+                        email_text = generate_email(
+                            first, last, research, openai_key,
+                            company=company,
+                            salutation=person.get("salutation", ""),
+                            notes=person.get("notes", "") or person.get("title", ""),
+                        )
                     except Exception as e:
                         email_text = f"E-posta oluşturulamadı: {e}"
 
@@ -287,12 +465,19 @@ elif active_tab == "Toplu Üretim":
             # Build CSV
             out = io.StringIO()
             writer = csv.writer(out, quoting=csv.QUOTE_ALL)
-            writer.writerow(["Ad", "Soyad", "Pozisyon", "Kaynak", "LinkedIn URL", "E-posta"])
+            writer.writerow([
+                "Atanan", "Şirket", "Ad", "Soyad", "Hitap",
+                "Alıcı E-posta", "Not", "Kaynak", "LinkedIn URL", "Üretilen E-posta",
+            ])
             for r in results:
                 writer.writerow([
+                    r.get("assignee", ""),
+                    r.get("company", "") or r.get("source", ""),
                     r.get("first", ""),
                     r.get("last", ""),
-                    r.get("title", ""),
+                    r.get("salutation", ""),
+                    r.get("email", ""),
+                    r.get("notes", "") or r.get("title", ""),
                     r.get("source", ""),
                     r.get("linkedin_url", ""),
                     r.get("email_text", ""),
@@ -308,16 +493,20 @@ elif active_tab == "Toplu Üretim":
             )
 
             st.markdown("**Önizleme:**")
-            for r in results:
+            for i, r in enumerate(results):
                 label = r["name"]
-                if r.get("title"):
+                if r.get("company") or r.get("source"):
+                    label += f" — {r.get('company') or r.get('source')}"
+                elif r.get("title"):
                     label += f" — {r['title']}"
                 with st.expander(label):
+                    if r.get("email"):
+                        st.caption(f"Alıcı: {r['email']}")
                     st.text_area(
                         "E-posta",
                         r["email_text"],
                         height=300,
-                        key=f"preview_{r['linkedin_url']}",
+                        key=f"preview_{i}",
                         label_visibility="collapsed",
                     )
 
